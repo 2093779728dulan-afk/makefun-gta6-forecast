@@ -5,9 +5,43 @@ import os
 import re
 from pathlib import Path
 
-Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
 HOURS = tuple(range(2, 25))
-MIN_SPREAD = 0.15
+QUANTILE_LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+SMOOTH_WEIGHTS = (0.25, 0.5, 0.25)
+RATIO_MIN = -2.0
+RATIO_MAX = 3.0
+CLOSE_RATIO_LIMIT = math.log(3.0)
+CLOSE_BONUS = 0.25
+STORY_GAME_TERMS = (
+    "red dead",
+    "spider-man",
+    "spiderman",
+    "god of war",
+    "wolverine",
+    "grand theft auto",
+    "elden ring",
+    "hogwarts",
+    "cyberpunk",
+    "ghost of",
+    "zelda",
+    "assassin's creed",
+    "final fantasy",
+    "the last of us",
+    "death stranding",
+    "stellar blade",
+    "black myth",
+    "kingdom come",
+    "monster hunter",
+    "baldur's gate",
+    "clair obscur",
+)
+PLATFORM_GROUPS = (
+    ("pc", "computer"),
+    ("playstation", "ps4", "ps5", "ps/5"),
+    ("xbox",),
+    ("switch",),
+    ("stadia",),
+)
 TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?", re.IGNORECASE)
 TIMESTAMP_HOUR_RE = re.compile(r"\d{4}-\d{2}-\d{2}T(\d{2}):\d{2}(?::\d{2})?", re.IGNORECASE)
 CLOCK_RE = re.compile(r"(?<![\d:T])(\d{1,2}):(\d{2})\s*(?:z|utc|gmt)\b", re.IGNORECASE)
@@ -68,17 +102,23 @@ def case_unlock_offset(case, day_start):
     return offset
 
 
-def weighted_median(items):
+def weighted_quantiles(items):
     ordered = sorted(items)
     total = sum(weight for _, weight in ordered)
     if total <= 0:
-        return 0.0
-    accumulated = 0.0
-    for value, weight in ordered:
-        accumulated += weight
-        if accumulated >= total / 2:
-            return value
-    return ordered[-1][0]
+        return [0.0] * len(QUANTILE_LEVELS)
+    quantiles = []
+    for level in QUANTILE_LEVELS:
+        target = level * total
+        accumulated = 0.0
+        value = ordered[-1][0]
+        for item_value, weight in ordered:
+            accumulated += weight
+            if accumulated >= target:
+                value = item_value
+                break
+        quantiles.append(value)
+    return quantiles
 
 
 def unlock_hours(text):
@@ -171,6 +211,24 @@ def comparable_curve(comparable):
     return curve
 
 
+def genre_weight(comparable):
+    name = str(comparable.get("name") or "").lower()
+    platforms = str(comparable.get("platforms") or "").lower()
+    weight = 1.0
+    if any(term in name for term in STORY_GAME_TERMS):
+        weight *= 1.4
+    has_playstation = any(
+        token in platforms for token in ("playstation 5", "ps5", "ps4/5", "ps4/ps5", "ps/5", "playstation", "ps4")
+    )
+    has_xbox = "xbox" in platforms
+    if has_playstation and has_xbox:
+        weight *= 1.2
+    platform_count = sum(
+        any(token in platforms for token in group) for group in PLATFORM_GROUPS
+    )
+    return weight * (1.0 + 0.08 * max(0, platform_count - 1))
+
+
 def comparable_weight(comparable, first_hour, case_print, case_date, similarity):
     platforms = str(comparable.get("platforms") or "").lower()
     if any(name in platforms for name in ("playstation 5", "ps5", "ps/5", "ps4/5", "ps4/ps5")):
@@ -182,8 +240,17 @@ def comparable_weight(comparable, first_hour, case_print, case_date, similarity)
     start = parse_time(comparable.get("day_start"))
     age = (start.date() - case_date).days if start is not None else 0
     recency_weight = math.exp(max(-4000, min(4000, age)) / 1000.0)
-    closeness_weight = math.exp(-abs(math.log(first_hour / case_print)) / 1.5)
-    return platform_weight * recency_weight * closeness_weight * similarity
+    log_gap = abs(math.log(first_hour / case_print))
+    closeness_weight = math.exp(-log_gap / 1.5)
+    if log_gap <= CLOSE_RATIO_LIMIT:
+        closeness_weight *= 1.0 + CLOSE_BONUS * (1.0 - log_gap / CLOSE_RATIO_LIMIT)
+    return (
+        platform_weight
+        * recency_weight
+        * closeness_weight
+        * similarity
+        * genre_weight(comparable)
+    )
 
 
 def curve_value(curve, hour):
@@ -229,27 +296,27 @@ def make_forecast(case):
         if weight > 0:
             series.append((weight, curve, reference))
 
-    rows = []
-    for hour in HOURS:
+    log_quantiles = {}
+    for hour in range(1, max(HOURS) + 2):
         offset = reference_offset + hour - 1
         items = []
         for weight, curve, reference in series:
             value = curve_value(curve, offset)
             if value is not None:
                 items.append((value - reference, weight))
-        if items:
-            ratio = weighted_median(items)
-            total = sum(weight for _, weight in items)
-            mean = sum(value * weight for value, weight in items) / total
-            variance = sum(weight * (value - mean) ** 2 for value, weight in items) / total
-            spread = max(MIN_SPREAD, math.sqrt(variance))
-        else:
-            ratio = 0.0
-            spread = MIN_SPREAD
-        ratio = max(-2.0, min(3.0, ratio))
+        log_quantiles[hour] = weighted_quantiles(items)
+
+    rows = []
+    for hour in HOURS:
         quantiles = []
-        for z_score in Z_SCORES:
-            value = case_print * math.exp(ratio + z_score * spread)
+        for index in range(len(QUANTILE_LEVELS)):
+            ratio = (
+                SMOOTH_WEIGHTS[0] * log_quantiles[hour - 1][index]
+                + SMOOTH_WEIGHTS[1] * log_quantiles[hour][index]
+                + SMOOTH_WEIGHTS[2] * log_quantiles[hour + 1][index]
+            )
+            ratio = max(RATIO_MIN, min(RATIO_MAX, ratio))
+            value = case_print * math.exp(ratio)
             quantiles.append(round(min(1e9, max(0.01, value)), 2))
         rows.append({"hour": hour, "q": quantiles})
     return {"hours": rows}
