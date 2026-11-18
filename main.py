@@ -3,16 +3,13 @@ import json
 import math
 import os
 import re
-import statistics
 from pathlib import Path
 
 HOURS = tuple(range(2, 25))
 QUANTILE_LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 SMOOTH_WEIGHTS = (0.25, 0.5, 0.25)
-LOG_RATIO_CLIP = 2.5
-OUTER_WIDEN = 1.10
-MOMENTUM_STRENGTH = 0.3
-MOMENTUM_DECAY = 6.0
+LOG_RATIO_CLIP = 3.0
+OUTER_WIDEN = 1.06
 RATIO_MIN = -2.0
 RATIO_MAX = 3.0
 CLOSE_RATIO_LIMIT = math.log(3.0)
@@ -216,20 +213,6 @@ def comparable_curve(comparable):
     return curve
 
 
-def history_level(rows, day_start):
-    if day_start is None:
-        return None
-    values = []
-    for row in rows or []:
-        moment = parse_time(row.get("from"))
-        viewers = row.get("viewers")
-        if moment is None or not isinstance(viewers, (int, float)) or viewers <= 0:
-            continue
-        if moment < day_start:
-            values.append(float(viewers))
-    return statistics.median(values) if values else None
-
-
 def genre_weight(comparable):
     name = str(comparable.get("name") or "").lower()
     platforms = str(comparable.get("platforms") or "").lower()
@@ -300,10 +283,8 @@ def make_forecast(case):
     case_anchor = case_unlock_offset(case, start)
     reference_offset = -case_anchor
     case_features = case_unlock_features(case)
-    case_level = history_level(case.get("history_hourly"), start)
 
     series = []
-    predicted_prints = []
     for comparable in case.get("comparables") or []:
         curve = comparable_curve(comparable)
         if curve is None:
@@ -316,15 +297,6 @@ def make_forecast(case):
         weight = comparable_weight(comparable, math.exp(reference), case_print, case_date, similarity)
         if weight > 0:
             series.append((weight, curve, reference))
-        comp_level = history_level(comparable.get("hourly"), parse_time(comparable.get("day_start")))
-        if case_level and comp_level and comp_level > 0:
-            predicted_prints.append(case_level * math.exp(reference) / comp_level)
-
-    log_m = 0.0
-    if predicted_prints:
-        predicted_print = statistics.median(predicted_prints)
-        if predicted_print > 0:
-            log_m = math.log(case_print / predicted_print)
 
     log_quantiles = {}
     for hour in range(1, max(HOURS) + 2):
@@ -335,8 +307,7 @@ def make_forecast(case):
             if value is not None:
                 ratio = max(-LOG_RATIO_CLIP, min(LOG_RATIO_CLIP, value - reference))
                 items.append((ratio, weight))
-        shift = MOMENTUM_STRENGTH * log_m * math.exp(-(hour - 1) / MOMENTUM_DECAY)
-        log_quantiles[hour] = [ratio + shift for ratio in weighted_quantiles(items)]
+        log_quantiles[hour] = weighted_quantiles(items)
 
     rows = []
     for hour in HOURS:
